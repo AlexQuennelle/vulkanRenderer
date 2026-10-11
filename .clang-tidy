@@ -1,0 +1,45 @@
+---
+Checks: "-*,
+        bugprone-*,
+        -bugprone-easily-swappable-parameters,
+
+        cert-*,
+        -cert-dcl16-c,
+
+        modernize-*,
+        -modernize-use-nodiscard,
+
+        readability-*,
+        -readability-make-member-function-const,
+        -readability-magic-numbers,
+        -readability-braces-around-statements,
+        -readability-uppercase-literal-suffix,
+        -readability-else-after-return,
+        -readability-static-accessed-through-instance,
+        -readability-avoid-const-params-in-decls,
+
+        portability-*,
+
+        performance-*,
+
+        cppcoreguidelines-*,
+        -cppcoreguidelines-non-private-member-variables-in-classes,
+        -cppcoreguidelines-avoid-magic-numbers,
+        -cppcoreguidelines-avoid-const-or-ref-data-members,
+        -cppcoreguidelines-pro-bounds-constant-array-index,
+
+        misc-*,
+        -misc-use-internal-linkage,
+        -misc-non-private-member-variables-in-classes,
+"
+WarningsAsErrors: ''
+HeaderFilterRegex: ''
+FormatStyle:     file
+
+CheckOptions:
+  - key: readability-identifier-length.IgnoredVariableNames
+    value: 'x|y|z|i|j|t|a|b|c'
+  - key: readability-identifier-length.IgnoredParameterNames
+    value: 'x|y|z|i|j|a|b|c'
+  - key: readability-identifier-length.MinimumLoopCounterNameLength
+    value: '1'
