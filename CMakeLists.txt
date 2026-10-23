@@ -27,6 +27,8 @@ project(
     VERSION 0.0
 )
 
+include(cmake/utils.cmake)
+
 find_package(glfw3 REQUIRED)
 find_package(glm   REQUIRED)
 find_package(Vulkan REQUIRED)
@@ -85,12 +87,20 @@ target_compile_definitions(
 RESOURCES_PATH=$<IF:$<CONFIG:Release>,"./resources/","${DEBUG_RESOURCE_DIR}">
 )
 
+set(SHADER_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
+target_compile_definitions(
+    ${CMAKE_PROJECT_NAME} PUBLIC
+    SHADERS=$<IF:$<CONFIG:Release>,".shaders/","${CMAKE_BINARY_DIR}/shaders/">
+)
+
 target_compile_features("${CMAKE_PROJECT_NAME}" PRIVATE cxx_std_26)
 target_sources("${CMAKE_PROJECT_NAME}"
     PRIVATE
     src/main.cpp
     src/program.cpp
 )
+add_shader(tringle SOURCES ${SHADER_SOURCE_DIR}/shader.slang)
+add_dependencies(${CMAKE_PROJECT_NAME} tringle)
 target_include_directories(
   "${CMAKE_PROJECT_NAME}" PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include/"
 )

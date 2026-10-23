@@ -1,9 +1,12 @@
 #include "program.hpp"
 
 #include <GLFW/glfw3.h>
+#include <csignal>
 #include <map>
 #include <print>
 #include <ranges>
+
+constexpr std::string SHADER_EXTENSION{".spv"};
 
 const std::vector<const char*> VALIDATION_LAYERS = {
 	// NOLINT
@@ -21,6 +24,25 @@ constexpr auto IsGraphicsQueue(const vk::QueueFamilyProperties& val) -> bool
 		   != static_cast<vk::QueueFlags>(0);
 };
 
+inline auto LoadShader(const std::string& filename) -> std::vector<char>
+{
+	std::ifstream file{filename + SHADER_EXTENSION,
+					   std::ios::ate | std::ios::binary};
+	if (!file.is_open())
+	{
+		std::println(stderr, "ERROR: Failed to load shader {}: {}",
+					 filename + SHADER_EXTENSION, std::strerror(errno));
+		std::exit(1);
+	}
+
+	std::vector<char> data(static_cast<size_t>(file.tellg()));
+	file.seekg(0, std::ios::beg);
+	file.read(data.data(), static_cast<std::streamsize>(data.size()));
+	file.close();
+
+	return data;
+}
+
 void Program::Run()
 {
 	std::println("Hello, Vulkan!");
@@ -29,6 +51,7 @@ void Program::Run()
 	{
 		glfwPollEvents();
 		this->Update();
+		this->Draw();
 	}
 
 	// Cleanup
@@ -50,8 +73,50 @@ void Program::Init()
 	this->PickPhysicalDevice();
 	this->CreateLogicalDevice();
 	this->CreateSwapChain();
+	this->CreateImageViews();
+	this->CreateGraphicsPipeline();
+	this->CreateCommandPool();
+	this->CreateCommandBuffer();
+	this->CreateSyncObjects();
 };
 void Program::Update() { }
+void Program::Draw()
+{
+	auto fenceResult{
+		this->device.waitForFences(*this->drawFence, vk::True, UINT64_MAX),
+	};
+	if (fenceResult != vk::Result::eSuccess)
+	{
+		std::println(stderr, "ERROR: Failed to wait for fence");
+		std::exit(1);
+	}
+	this->device.resetFences(*this->drawFence);
+
+	auto [result, imageIdx] = this->swapChain.acquireNextImage(
+		UINT64_MAX, *this->presentCompleteS, nullptr);
+	this->RecordCommandBuffer(imageIdx);
+	vk::PipelineStageFlags waitDestStageMask{
+		vk::PipelineStageFlagBits::eColorAttachmentOutput};
+	const vk::SubmitInfo submitInfo{
+		.waitSemaphoreCount = 1,
+		.pWaitSemaphores = &*this->presentCompleteS,
+		.pWaitDstStageMask = &waitDestStageMask,
+		.commandBufferCount = 1,
+		.pCommandBuffers = &*this->commandBuffer,
+		.signalSemaphoreCount = 1,
+		.pSignalSemaphores = &*this->renderFinishedS,
+	};
+	this->graphicsQueue.submit(submitInfo, *this->drawFence);
+
+	vk::PresentInfoKHR presentInfo{
+		.waitSemaphoreCount = 1,
+		.pWaitSemaphores = &*this->renderFinishedS,
+		.swapchainCount = 1,
+		.pSwapchains = &*this->swapChain,
+		.pImageIndices = &imageIdx,
+	};
+	result = this->graphicsQueue.presentKHR(presentInfo);
+}
 
 void Program::CreateVKInstance()
 {
@@ -192,14 +257,14 @@ void Program::PickPhysicalDevice()
 		bool hasRequiredFeats
 			= (deviceFeats.get<vk::PhysicalDeviceVulkan11Features>()
 				   .shaderDrawParameters
-			   != 0u)
+			   != vk::False)
 			  && (deviceFeats.get<vk::PhysicalDeviceVulkan13Features>()
 					  .dynamicRendering
-				  != 0u)
+				  != vk::False)
 			  && (deviceFeats
 					  .get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>()
 					  .extendedDynamicState
-				  != 0u);
+				  != vk::False);
 
 		auto queueFamilies{device.getQueueFamilyProperties()};
 		auto deviceExtensions = device.enumerateDeviceExtensionProperties();
@@ -277,7 +342,7 @@ void Program::CreateLogicalDevice()
 		r::find_if(queueFamProperties,
 				   [](const auto& val) { return IsGraphicsQueue(val); }),
 	};
-	uint32_t graphicsIdx{~0u};
+	// uint32_t this->graphicsIdx{~0u};
 	for (const uint32_t i : r::views::iota(0u, queueFamProperties.size()))
 	{
 		const auto& queueFam{queueFamProperties[i]};
@@ -293,21 +358,21 @@ void Program::CreateLogicalDevice()
 
 		if (IsGraphicsQueue(queueFam) && (supportsKHR.value != 0))
 		{
-			graphicsIdx = i;
+			this->graphicsIdx = i;
 			break;
 		}
 	}
-	if (graphicsIdx == !0u)
+	if (this->graphicsIdx == ~0u)
 	{
 		std::println(stderr,
 					 "ERROR: Could not find suitable graphics/presnt queue");
 		std::exit(1);
 	}
-	// auto graphicsIdx{static_cast<uint32_t>(
+	// auto this->graphicsIdx{static_cast<uint32_t>(
 	// 	r::distance(queueFamProperties.begin(), graphicsQueueFamIt))};
 	const float queuePrio{0.5f};
 	vk::DeviceQueueCreateInfo deviceQueueCreateInfo{
-		.queueFamilyIndex = graphicsIdx,
+		.queueFamilyIndex = this->graphicsIdx,
 		.queueCount = 1,
 		.pQueuePriorities = &queuePrio,
 	};
@@ -317,9 +382,9 @@ void Program::CreateLogicalDevice()
 					   vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>
 		featureChain = {
 			{},
-			{.shaderDrawParameters = 1u},
-			{.dynamicRendering = 1u},
-			{.extendedDynamicState = 1u},
+			{.shaderDrawParameters = vk::True},
+			{.synchronization2 = vk::True, .dynamicRendering = vk::True},
+			{.extendedDynamicState = vk::True},
 	};
 	std::vector<const char*> requiredDeviceExtensions{
 		vk::KHRSwapchainExtensionName,
@@ -341,7 +406,7 @@ void Program::CreateLogicalDevice()
 	else
 	{
 		this->device = std::move(device.value);
-		this->graphicsQueue = this->device.getQueue(graphicsIdx, 0);
+		this->graphicsQueue = this->device.getQueue(this->graphicsIdx, 0);
 	}
 }
 void Program::CreateSwapChain()
@@ -468,4 +533,305 @@ void Program::CreateSwapChain()
 			this->swapChainImages = std::move(images.value);
 		}
 	}
+}
+void Program::CreateImageViews()
+{
+	vk::ImageViewCreateInfo viewCreateInfo{
+		.viewType = vk::ImageViewType::e2D,
+		.format = this->swapChainSurfaceFormat.format,
+		.subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
+							 .baseMipLevel = 0,
+							 .levelCount = 1,
+							 .baseArrayLayer = 0,
+							 .layerCount = 1,},
+	};
+	for (auto& image : this->swapChainImages)
+	{
+		viewCreateInfo.image = image;
+		auto imgView{device.createImageView(viewCreateInfo)};
+		if (!imgView.has_value())
+		{
+			std::println(stderr, "ERROR: {}", vk::to_string(imgView.result));
+			std::exit(1);
+		}
+		else
+		{
+			this->swapChainImageViews.emplace_back(std::move(imgView.value));
+		}
+	}
+}
+void Program::CreateGraphicsPipeline()
+{
+	auto shaderCode = LoadShader(SHADERS "tringle");
+	vk::ShaderModuleCreateInfo shaderCreateInfo{
+		.codeSize = shaderCode.size() * sizeof(char),
+		.pCode = reinterpret_cast<const uint32_t*>(shaderCode.data()), // GROSS
+	};
+	auto shaderModule{device.createShaderModule(shaderCreateInfo)};
+	if (!shaderModule.has_value())
+	{
+		std::println(stderr, "ERROR: {}", vk::to_string(shaderModule.result));
+		std::exit(1);
+	}
+
+	vk::PipelineShaderStageCreateInfo vertStageInfo{
+		.stage = vk::ShaderStageFlagBits::eVertex,
+		.module = shaderModule.value,
+		.pName = "vertMain",
+	};
+	vk::PipelineShaderStageCreateInfo fragStageInfo{
+		.stage = vk::ShaderStageFlagBits::eFragment,
+		.module = shaderModule.value,
+		.pName = "fragMain",
+	};
+	std::array<vk::PipelineShaderStageCreateInfo, 2> stages{{
+		vertStageInfo,
+		fragStageInfo,
+	}};
+
+	vk::PipelineVertexInputStateCreateInfo vertexInputInfo;
+
+	vk::PipelineInputAssemblyStateCreateInfo inputAssembly{
+		.topology = vk::PrimitiveTopology::eTriangleList,
+	};
+
+	vk::PipelineViewportStateCreateInfo viewportState{
+		.viewportCount = 1,
+		.scissorCount = 1,
+	};
+
+	vk::PipelineRasterizationStateCreateInfo rasterizer{
+		.depthClampEnable = vk::False,
+		.rasterizerDiscardEnable = vk::False,
+		.polygonMode = vk::PolygonMode::eFill,
+		.cullMode = vk::CullModeFlagBits::eBack,
+		.frontFace = vk::FrontFace::eClockwise,
+		.depthBiasEnable = vk::False,
+		.lineWidth = 1.0f,
+	};
+
+	vk::PipelineMultisampleStateCreateInfo multisampling{};
+	multisampling = {
+		.rasterizationSamples = vk::SampleCountFlagBits::e1,
+		.sampleShadingEnable = vk::False,
+	};
+
+	vk::PipelineColorBlendAttachmentState colorBlendAttachment{
+		.blendEnable = vk::True,
+		.srcColorBlendFactor = vk::BlendFactor::eSrcAlpha,
+		.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
+		.colorBlendOp = vk::BlendOp::eAdd,
+		.srcAlphaBlendFactor = vk::BlendFactor::eOne,
+		.dstAlphaBlendFactor = vk::BlendFactor::eZero,
+		.alphaBlendOp = vk::BlendOp::eAdd,
+		.colorWriteMask = vk::ColorComponentFlagBits::eR
+						  | vk::ColorComponentFlagBits::eG
+						  | vk::ColorComponentFlagBits::eB
+						  | vk::ColorComponentFlagBits::eA,
+	};
+	vk::PipelineColorBlendStateCreateInfo colorBlending{
+		.logicOpEnable = vk::False,
+		.logicOp = vk::LogicOp::eCopy,
+		.attachmentCount = 1,
+		.pAttachments = &colorBlendAttachment,
+	};
+
+	std::vector<vk::DynamicState> dynamicStates{
+		vk::DynamicState::eViewport,
+		vk::DynamicState::eScissor,
+	};
+	vk::PipelineDynamicStateCreateInfo dynamicState{
+		.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()),
+		.pDynamicStates = dynamicStates.data(),
+	};
+
+	vk::PipelineLayoutCreateInfo pipelineLayoutInfo{
+		.setLayoutCount = 0,
+		.pushConstantRangeCount = 0,
+	};
+	auto pipelineLayout{this->device.createPipelineLayout(pipelineLayoutInfo)};
+	if (!pipelineLayout.has_value())
+	{
+		std::println(stderr, "ERROR: {}", vk::to_string(pipelineLayout.result));
+		std::exit(1);
+	}
+	this->pipelineLayout = std::move(pipelineLayout.value);
+
+	vk::StructureChain<vk::GraphicsPipelineCreateInfo,
+					   vk::PipelineRenderingCreateInfo>
+		pipelineCreateInfoChain{};
+	pipelineCreateInfoChain = {
+		vk::GraphicsPipelineCreateInfo{
+			.stageCount = 2,
+			.pStages = stages.data(),
+			.pVertexInputState = &vertexInputInfo,
+			.pInputAssemblyState = &inputAssembly,
+			.pViewportState = &viewportState,
+			.pRasterizationState = &rasterizer,
+			.pMultisampleState = &multisampling,
+			.pColorBlendState = &colorBlending,
+			.pDynamicState = &dynamicState,
+			.layout = this->pipelineLayout,
+			// .layout = pipelineLayout.value,
+			.renderPass = nullptr,
+		},
+		{
+			.colorAttachmentCount = 1,
+			.pColorAttachmentFormats = &this->swapChainSurfaceFormat.format,
+		},
+	};
+
+	auto pipeline{
+		this->device.createGraphicsPipeline(
+			nullptr,
+			pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>()),
+	};
+	if (!pipeline.has_value())
+	{
+		std::println(stderr, "ERROR: {}", vk::to_string(pipeline.result));
+		std::exit(1);
+	}
+	this->graphicsPipeline = std::move(pipeline.value);
+}
+void Program::CreateCommandPool()
+{
+	vk::CommandPoolCreateInfo poolCreateInfo{
+		.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+		.queueFamilyIndex = this->graphicsIdx,
+	};
+	auto commandPool{this->device.createCommandPool(poolCreateInfo)};
+	if (!commandPool.has_value())
+	{
+		std::println(stderr, "ERROR: {}", vk::to_string(commandPool.result));
+		std::exit(1);
+	}
+	this->commandPool = std::move(commandPool.value);
+}
+void Program::CreateCommandBuffer()
+{
+	vk::CommandBufferAllocateInfo allocateInfo{
+		.commandPool = this->commandPool,
+		.level = vk::CommandBufferLevel::ePrimary,
+		.commandBufferCount = 1,
+	};
+	auto buffers{this->device.allocateCommandBuffers(allocateInfo)};
+	if (!buffers.has_value())
+	{
+		std::println(stderr, "ERROR: {}", vk::to_string(buffers.result));
+		std::exit(1);
+	}
+	else if (buffers->empty())
+	{
+		std::println(stderr, "ERROR: No command buffers allocated");
+		std::exit(1);
+	}
+	this->commandBuffer = std::move(buffers.value.front());
+}
+void Program::RecordCommandBuffer(uint32_t imgIdx)
+{
+	this->commandBuffer.begin({});
+	this->TransitionImageLayout(
+		imgIdx, vk::ImageLayout::eUndefined,
+		vk::ImageLayout::eColorAttachmentOptimal, {},
+		vk::AccessFlagBits2::eColorAttachmentWrite,
+		vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+		vk::PipelineStageFlagBits2::eColorAttachmentOutput);
+
+	vk::ClearValue clearColor{vk::ClearColorValue(100u, 149u, 237u, 255u)};
+	vk::RenderingAttachmentInfo attachmentInfo{
+		.imageView = this->swapChainImageViews[imgIdx],
+		.imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		.loadOp = vk::AttachmentLoadOp::eClear,
+		.storeOp = vk::AttachmentStoreOp::eStore,
+		.clearValue = clearColor,
+	};
+	vk::RenderingInfo renderingInfo{
+		.renderArea = {
+			.offset = { .x= 0, .y = 0 },
+			.extent = this->swapChainExtent,
+		},
+		.layerCount = 1,
+		.colorAttachmentCount = 1,
+		.pColorAttachments = &attachmentInfo,
+	};
+
+	raise(SIGTRAP);
+	this->commandBuffer.beginRendering(renderingInfo);
+	this->commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
+									 this->graphicsPipeline);
+	this->commandBuffer.setViewport(
+		0, vk::Viewport(
+			   0.0f, 0.0f, static_cast<float>(this->swapChainExtent.width),
+			   static_cast<float>(this->swapChainExtent.height), 0.0f, 1.0f));
+	this->commandBuffer.setScissor(
+		0, vk::Rect2D(vk::Offset2D(0, 0), this->swapChainExtent));
+	this->commandBuffer.draw(3, 1, 0, 0);
+
+	this->commandBuffer.endRendering();
+	this->TransitionImageLayout(
+		imgIdx, vk::ImageLayout::eColorAttachmentOptimal,
+		vk::ImageLayout::ePresentSrcKHR,
+		vk::AccessFlagBits2::eColorAttachmentWrite, {},
+		vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+		vk::PipelineStageFlagBits2::eBottomOfPipe);
+	this->commandBuffer.end();
+}
+void Program::TransitionImageLayout(uint32_t imgIdx, vk::ImageLayout oldLayout,
+									vk::ImageLayout newLayout,
+									vk::AccessFlags2 srcAccess,
+									vk::AccessFlags2 dstAccess,
+									vk::PipelineStageFlags2 srcStage,
+									vk::PipelineStageFlags2 dstStage)
+{
+	vk::ImageMemoryBarrier2 barrier{
+		.srcStageMask = srcStage,
+		.srcAccessMask = srcAccess,
+		.dstStageMask = dstStage,
+		.dstAccessMask = dstAccess,
+		.oldLayout = oldLayout,
+		.newLayout = newLayout,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.image = this->swapChainImages.at(imgIdx),
+		.subresourceRange = {
+			.aspectMask = vk::ImageAspectFlagBits::eColor,
+			.baseMipLevel = 0,
+			.levelCount = 1,
+			.baseArrayLayer = 0,
+			.layerCount = 1,
+		},
+	};
+	vk::DependencyInfo dependencyInfo{
+		.dependencyFlags = {},
+		.imageMemoryBarrierCount = 1,
+		.pImageMemoryBarriers = &barrier,
+	};
+	this->commandBuffer.pipelineBarrier2(dependencyInfo);
+}
+void Program::CreateSyncObjects()
+{
+	auto present{this->device.createSemaphore({})};
+	if (!present.has_value())
+	{
+		std::println(stderr, "ERROR: {}", vk::to_string(present.result));
+		std::exit(1);
+	}
+	auto render{this->device.createSemaphore({})};
+	if (!render.has_value())
+	{
+		std::println(stderr, "ERROR: {}", vk::to_string(render.result));
+		std::exit(1);
+	}
+	auto draw{
+		this->device.createFence({.flags = vk::FenceCreateFlagBits::eSignaled}),
+	};
+	if (!draw.has_value())
+	{
+		std::println(stderr, "ERROR: {}", vk::to_string(draw.result));
+		std::exit(1);
+	}
+
+	this->presentCompleteS = std::move(present.value);
+	this->renderFinishedS = std::move(render.value);
+	this->drawFence = std::move(draw.value);
 }
