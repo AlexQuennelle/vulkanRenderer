@@ -21,11 +21,14 @@ const std::vector<const char*> REQUIRED_DEVICE_EXTENSIONS{
 	vk::KHRSwapchainExtensionName,
 };
 
-constexpr auto IsGraphicsQueue(const vk::QueueFamilyProperties& val) -> bool
+template <typename T> constexpr void CheckError(T& object)
 {
-	return (val.queueFlags & vk::QueueFlagBits::eGraphics)
-		   != static_cast<vk::QueueFlags>(0);
-};
+	if (!object.has_value())
+	{
+		std::println(stderr, "ERROR: {}", vk::to_string(object.result));
+		std::exit(1);
+	}
+}
 
 inline auto LoadShader(const std::string& filename) -> std::vector<char>
 {
@@ -82,7 +85,7 @@ void Program::Init()
 	this->CreateCommandPool();
 	this->CreateCommandBuffer();
 	this->CreateSyncObjects();
-};
+}
 void Program::Update() { }
 void Program::Draw()
 {
@@ -114,14 +117,14 @@ void Program::Draw()
 	};
 	this->graphicsQueue.submit(submitInfo, *this->drawFence);
 
-	vk::PresentInfoKHR presentInfo{
+	const vk::PresentInfoKHR presentInfoKHR{
 		.waitSemaphoreCount = 1,
 		.pWaitSemaphores = &*this->renderFinishedSemaphore,
 		.swapchainCount = 1,
 		.pSwapchains = &*this->swapChain,
 		.pImageIndices = &imageIdx,
 	};
-	result = this->graphicsQueue.presentKHR(presentInfo);
+	result = this->graphicsQueue.presentKHR(presentInfoKHR);
 	switch (result)
 	{
 	case vk::Result::eSuccess:
@@ -152,12 +155,9 @@ void Program::CreateVKInstance()
 		requiredLayers.assign(VALIDATION_LAYERS.begin(),
 							  VALIDATION_LAYERS.end());
 	}
+
 	auto layerProps{this->context.enumerateInstanceLayerProperties()};
-	if (!layerProps.has_value())
-	{
-		std::println("ERROR: {}", vk::to_string(layerProps.result));
-		std::exit(1);
-	}
+	CheckError(layerProps);
 	for (const auto* requiredLayer : requiredLayers)
 	{
 		auto comp = [requiredLayer](const auto& layerProp) -> bool
@@ -178,12 +178,7 @@ void Program::CreateVKInstance()
 		glfwGetRequiredInstanceExtensions(&glfwExtensionCount),
 	};
 	auto extensionProps{this->context.enumerateInstanceExtensionProperties()};
-	if (!extensionProps.has_value())
-	{
-		std::println(stderr, "ERROR: {}", vk::to_string(extensionProps.result));
-		std::exit(1);
-	}
-
+	CheckError(extensionProps);
 	std::span<const char*> glfwExtensionRange{glfwExtensions,
 											  glfwExtensionCount};
 	for (const auto* const glfwExtension : glfwExtensionRange)
@@ -214,16 +209,9 @@ void Program::CreateVKInstance()
 		.enabledExtensionCount = glfwExtensionCount,
 		.ppEnabledExtensionNames = glfwExtensions,
 	};
-	auto temp = this->context.createInstance(createInfo);
-	if (!temp.has_value())
-	{
-		std::println(stderr, "ERROR: {}", vk::to_string(temp.result));
-		std::exit(1);
-	}
-	else
-	{
-		this->instance = std::move(temp.value);
-	}
+	auto temp{this->context.createInstance(createInfo)};
+	CheckError(temp);
+	this->instance = std::move(temp.value);
 }
 void Program::CreateSurface()
 {
@@ -234,21 +222,16 @@ void Program::CreateSurface()
 	};
 	if (surfaceResult != 0)
 	{
-		std::println(stderr, "ERROR: Failed to create window Surface");
+		std::println(stderr, "ERROR: failed to create window surface!");
 		std::exit(1);
 	}
 	this->surface = vk::raii::SurfaceKHR(this->instance, _surface);
 }
-
 void Program::PickPhysicalDevice()
 {
 	auto devices{this->instance.enumeratePhysicalDevices()};
-	if (!devices.has_value())
-	{
-		std::println(stderr, "ERROR: {}", vk::to_string(devices.result));
-		std::exit(1);
-	}
-	if (devices->empty())
+	CheckError(devices);
+	if (devices.value.empty())
 	{
 		std::println(stderr, "ERROR: Failed to find GPUs with Vulkan support");
 		std::exit(1);
@@ -256,26 +239,49 @@ void Program::PickPhysicalDevice()
 
 	std::multimap<int, vk::raii::PhysicalDevice> candidateGPUs;
 
-	std::println(stdout, "Finding Suitable GPUs");
-
 	for (auto& device : devices.value)
 	{
 		namespace r = std::ranges;
 		auto deviceProps{device.getProperties()};
 		std::println(stdout, "Found GPU: {}",
 					 std::string(deviceProps.deviceName));
+
 		if (deviceProps.apiVersion < vk::ApiVersion13)
 		{
-			std::println(stdout, "	GPU failed because: Incorrect API Version");
+			std::println(stdout, "	GPU failed because: Incorrect API version");
 			continue;
 		}
+		else
+		{
+			std::println(stdout, "	GPU has suitable API version");
+		}
 
+		bool hasSuitableQueue{false};
 		auto queueFamilies{device.getQueueFamilyProperties()};
-		if (r::none_of(queueFamilies, IsGraphicsQueue))
+		for (const auto i : r::views::iota(0u, queueFamilies.size()))
+		{
+			bool graphics{
+				(queueFamilies.at(i).queueFlags & vk::QueueFlagBits::eGraphics)
+					!= static_cast<vk::QueueFlags>(0),
+			};
+			if (!graphics)
+				continue;
+			if (device.getSurfaceSupportKHR(i, *this->surface).value
+				== vk::False)
+				continue;
+
+			hasSuitableQueue = true;
+			break;
+		}
+		if (!hasSuitableQueue)
 		{
 			std::println(stdout,
 						 "	GPU failed because: Missing queue families");
 			continue;
+		}
+		else
+		{
+			std::println(stdout, "	GPU found suitable queue families");
 		}
 
 		auto deviceExtensions{device.enumerateDeviceExtensionProperties()};
@@ -292,6 +298,10 @@ void Program::PickPhysicalDevice()
 			std::println(stdout, "	GPU failed because: Missing extensions");
 			continue;
 		}
+		else
+		{
+			std::println(stdout, "	GPU supports all extensions");
+		}
 
 		auto feats{
 			device.getFeatures2<
@@ -302,17 +312,24 @@ void Program::PickPhysicalDevice()
 		bool hasRequiredFeats
 			= (feats.get<vk::PhysicalDeviceVulkan11Features>()
 				   .shaderDrawParameters
-			   != vk::False)
+			   == vk::True)
 			  && (feats.get<vk::PhysicalDeviceVulkan13Features>()
 					  .dynamicRendering
-				  != vk::False)
+				  == vk::True)
+			  && (feats.get<vk::PhysicalDeviceVulkan13Features>()
+					  .synchronization2
+				  == vk::True)
 			  && (feats.get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>()
 					  .extendedDynamicState
-				  != vk::False);
+				  == vk::True);
 		if (!hasRequiredFeats)
 		{
 			std::println(stdout, "	GPU failed because: Missing features");
 			continue;
+		}
+		else
+		{
+			std::println(stdout, "	GPU has all required features");
 		}
 
 		uint32_t score{0};
@@ -335,12 +352,14 @@ void Program::PickPhysicalDevice()
 
 		candidateGPUs.insert({score, device});
 	}
+	std::println();
 	if (!candidateGPUs.empty() && candidateGPUs.rbegin()->first > 0)
 	{
 		this->physicalDevice = candidateGPUs.rbegin()->second;
 		std::println(
 			stdout, "Selected GPU: {}",
 			std::string(this->physicalDevice.getProperties().deviceName));
+		std::println();
 	}
 	else
 	{
@@ -351,26 +370,23 @@ void Program::PickPhysicalDevice()
 void Program::CreateLogicalDevice()
 {
 	namespace r = std::ranges;
-	auto queueFamProperties{this->physicalDevice.getQueueFamilyProperties()};
+	auto queueFamilyProps{this->physicalDevice.getQueueFamilyProperties()};
 
-	for (const uint32_t i : r::views::iota(0u, queueFamProperties.size()))
+	for (const auto i : r::views::iota(0u, queueFamilyProps.size()))
 	{
-		const auto& queueFam{queueFamProperties[i]};
-		auto supportsKHR{
-			this->physicalDevice.getSurfaceSupportKHR(i, *this->surface),
+		bool graphics{
+			(queueFamilyProps.at(i).queueFlags & vk::QueueFlagBits::eGraphics)
+				!= static_cast<vk::QueueFlags>(0),
 		};
-		if (!supportsKHR.has_value())
-		{
-			std::println(stderr, "ERROR: {}",
-						 vk::to_string(supportsKHR.result));
-			std::exit(1);
-		}
+		if (!graphics)
+			continue;
+		auto present
+			= this->physicalDevice.getSurfaceSupportKHR(i, *this->surface);
+		if (present.value == vk::False)
+			continue;
 
-		if (IsGraphicsQueue(queueFam) && (supportsKHR.value != 0))
-		{
-			this->graphicsIdx = i;
-			break;
-		}
+		this->graphicsIdx = i;
+		break;
 	}
 	if (this->graphicsIdx == ~0u)
 	{
@@ -405,50 +421,37 @@ void Program::CreateLogicalDevice()
 		.ppEnabledExtensionNames = REQUIRED_DEVICE_EXTENSIONS.data(),
 	};
 
-	auto device = this->physicalDevice.createDevice(deviceCreateInfo);
-	if (!device.has_value())
-	{
-		std::println(stderr, "ERROR: {}", vk::to_string(device.result));
-		std::exit(1);
-	}
-	else
-	{
-		this->device = std::move(device.value);
-		this->graphicsQueue = this->device.getQueue(this->graphicsIdx, 0);
-	}
+	auto device{this->physicalDevice.createDevice(deviceCreateInfo)};
+	CheckError(device);
+	this->device = std::move(device.value);
+	this->graphicsQueue = this->device.getQueue(this->graphicsIdx, 0);
 }
 void Program::CreateSwapChain()
 {
 	namespace r = std::ranges;
-	const auto surfaceCapabilities{
+	auto surfaceCapabilities{
 		this->physicalDevice.getSurfaceCapabilitiesKHR(*this->surface),
 	};
-	if (!surfaceCapabilities.has_value())
-	{
-		std::println(stderr, "ERROR: {}",
-					 vk::to_string(surfaceCapabilities.result));
-		std::exit(1);
-	}
 
-	bool isExtentUnset = surfaceCapabilities->currentExtent.width
+	bool isExtentUnset = surfaceCapabilities.value.currentExtent.width
 						 != std::numeric_limits<uint32_t>::max();
 	if (isExtentUnset)
 	{
-		this->swapChainExtent = surfaceCapabilities->currentExtent;
+		this->swapChainExtent = surfaceCapabilities.value.currentExtent;
 	}
 	else
 	{
 		int width{};
 		int height{};
 		glfwGetFramebufferSize(this->window, &width, &height);
-		width = static_cast<int>(
-			std::clamp<uint32_t>(static_cast<uint32_t>(width),
-								 surfaceCapabilities->minImageExtent.width,
-								 surfaceCapabilities->maxImageExtent.width));
-		height = static_cast<int>(
-			std::clamp<uint32_t>(static_cast<uint32_t>(height),
-								 surfaceCapabilities->minImageExtent.height,
-								 surfaceCapabilities->maxImageExtent.height));
+		width = static_cast<int>(std::clamp<uint32_t>(
+			static_cast<uint32_t>(width),
+			surfaceCapabilities.value.minImageExtent.width,
+			surfaceCapabilities.value.maxImageExtent.width));
+		height = static_cast<int>(std::clamp<uint32_t>(
+			static_cast<uint32_t>(height),
+			surfaceCapabilities.value.minImageExtent.height,
+			surfaceCapabilities.value.maxImageExtent.height));
 		this->swapChainExtent = vk::Extent2D{
 			.width = static_cast<uint32_t>(width),
 			.height = static_cast<uint32_t>(height),
@@ -456,46 +459,36 @@ void Program::CreateSwapChain()
 	}
 
 	auto minImgCount{
-		std::max(3u, surfaceCapabilities->minImageCount),
+		std::max(3u, surfaceCapabilities.value.minImageCount),
 	};
 	auto isImgCountTooHigh{
-		(0 < surfaceCapabilities->maxImageCount)
-			&& (surfaceCapabilities->maxImageCount
-				< surfaceCapabilities->minImageCount),
+		(0 < surfaceCapabilities.value.maxImageCount)
+			&& (surfaceCapabilities.value.maxImageCount
+				< surfaceCapabilities.value.minImageCount),
 	};
 	if (isImgCountTooHigh)
 	{
-		minImgCount = surfaceCapabilities->maxImageCount;
+		minImgCount = surfaceCapabilities.value.maxImageCount;
 	}
 
 	auto availableFormats{
 		this->physicalDevice.getSurfaceFormatsKHR(*this->surface),
 	};
-	if (!availableFormats.has_value())
-	{
-		std::println(stderr, "ERROR: {}",
-					 vk::to_string(availableFormats.result));
-		std::exit(1);
-	}
+	CheckError(availableFormats);
 	auto formatCond = [](const auto& val) -> bool
 	{
 		return (val.format == vk::Format::eB8G8R8A8Srgb)
 			   && (val.colorSpace == vk::ColorSpaceKHR::eSrgbNonlinear);
 	};
 	const auto formatIt{r::find_if(availableFormats.value, formatCond)};
-	this->swapChainSurfaceFormat = formatIt != availableFormats->end()
+	this->swapChainSurfaceFormat = formatIt != availableFormats.value.end()
 									   ? *formatIt
 									   : availableFormats.value.at(0);
 
 	auto availablePresentModes{
-		this->physicalDevice.getSurfacePresentModesKHR(*this->surface),
+		physicalDevice.getSurfacePresentModesKHR(*surface),
 	};
-	if (!availablePresentModes.has_value())
-	{
-		std::println(stderr, "ERROR: {}",
-					 vk::to_string(availablePresentModes.result));
-		std::exit(1);
-	}
+	CheckError(availablePresentModes);
 	auto modeCond = [](const auto mode) -> bool
 	{
 		return mode == vk::PresentModeKHR::eMailbox;
@@ -515,35 +508,23 @@ void Program::CreateSwapChain()
 		.imageArrayLayers = 1,
 		.imageUsage = vk::ImageUsageFlagBits::eColorAttachment,
 		.imageSharingMode = vk::SharingMode::eExclusive,
-		.preTransform = surfaceCapabilities->currentTransform,
+		.preTransform = surfaceCapabilities.value.currentTransform,
 		.compositeAlpha = vk::CompositeAlphaFlagBitsKHR::eOpaque,
 		.presentMode = presentMode,
 		.clipped = vk::True,
 	};
+
 	auto swapChain{this->device.createSwapchainKHR(createInfo)};
-	if (!swapChain.has_value())
-	{
-		std::println(stderr, "ERROR: {}", vk::to_string(swapChain.result));
-		std::exit(1);
-	}
-	else
-	{
-		this->swapChain = std::move(swapChain.value);
-		auto images{this->swapChain.getImages()};
-		if (!images.has_value())
-		{
-			std::println(stderr, "ERROR: {}", vk::to_string(images.result));
-			std::exit(1);
-		}
-		else
-		{
-			this->swapChainImages = std::move(images.value);
-		}
-	}
+	CheckError(swapChain);
+	this->swapChain = std::move(swapChain.value);
+
+	auto images{this->swapChain.getImages()};
+	CheckError(images);
+	this->swapChainImages = std::move(images.value);
 }
 void Program::CreateImageViews()
 {
-	vk::ImageViewCreateInfo viewCreateInfo{
+	vk::ImageViewCreateInfo imageViewCreateInfo{
 		.viewType = vk::ImageViewType::e2D,
 		.format = this->swapChainSurfaceFormat.format,
 		.subresourceRange = {
@@ -556,46 +537,35 @@ void Program::CreateImageViews()
 	};
 	for (auto& image : this->swapChainImages)
 	{
-		viewCreateInfo.image = image;
-		auto imgView{device.createImageView(viewCreateInfo)};
-		if (!imgView.has_value())
-		{
-			std::println(stderr, "ERROR: {}", vk::to_string(imgView.result));
-			std::exit(1);
-		}
-		else
-		{
-			this->swapChainImageViews.emplace_back(std::move(imgView.value));
-		}
+		imageViewCreateInfo.image = image;
+		auto imgView{this->device.createImageView(imageViewCreateInfo)};
+		CheckError(imgView);
+		this->swapChainImageViews.emplace_back(std::move(imgView.value));
 	}
 }
 void Program::CreateGraphicsPipeline()
 {
-	auto shaderCode = LoadShader(SHADERS "tringle");
+	auto shaderCode{LoadShader(SHADERS "tringle")};
 	vk::ShaderModuleCreateInfo shaderCreateInfo{
 		.codeSize = shaderCode.size() * sizeof(char),
 		.pCode = reinterpret_cast<const uint32_t*>(shaderCode.data()), // GROSS
 	};
 	auto shaderModule{device.createShaderModule(shaderCreateInfo)};
-	if (!shaderModule.has_value())
-	{
-		std::println(stderr, "ERROR: {}", vk::to_string(shaderModule.result));
-		std::exit(1);
-	}
+	CheckError(shaderModule);
 
-	vk::PipelineShaderStageCreateInfo vertStageInfo{
+	vk::PipelineShaderStageCreateInfo vertShaderStageInfo{
 		.stage = vk::ShaderStageFlagBits::eVertex,
 		.module = shaderModule.value,
 		.pName = "vertMain",
 	};
-	vk::PipelineShaderStageCreateInfo fragStageInfo{
+	vk::PipelineShaderStageCreateInfo fragShaderStageInfo{
 		.stage = vk::ShaderStageFlagBits::eFragment,
 		.module = shaderModule.value,
 		.pName = "fragMain",
 	};
 	std::array<vk::PipelineShaderStageCreateInfo, 2> stages{{
-		vertStageInfo,
-		fragStageInfo,
+		vertShaderStageInfo,
+		fragShaderStageInfo,
 	}};
 
 	vk::PipelineVertexInputStateCreateInfo vertexInputInfo;
@@ -637,6 +607,7 @@ void Program::CreateGraphicsPipeline()
 						  | vk::ColorComponentFlagBits::eB
 						  | vk::ColorComponentFlagBits::eA,
 	};
+
 	vk::PipelineColorBlendStateCreateInfo colorBlending{
 		.logicOpEnable = vk::False,
 		.logicOp = vk::LogicOp::eCopy,
@@ -658,17 +629,13 @@ void Program::CreateGraphicsPipeline()
 		.pushConstantRangeCount = 0,
 	};
 	auto pipelineLayout{this->device.createPipelineLayout(pipelineLayoutInfo)};
-	if (!pipelineLayout.has_value())
-	{
-		std::println(stderr, "ERROR: {}", vk::to_string(pipelineLayout.result));
-		std::exit(1);
-	}
+	CheckError(pipelineLayout);
 	this->pipelineLayout = std::move(pipelineLayout.value);
 
 	vk::StructureChain<vk::GraphicsPipelineCreateInfo,
 					   vk::PipelineRenderingCreateInfo>
-		pipelineCreateInfoChain = {
-			vk::GraphicsPipelineCreateInfo{
+		pipelineCreateInfoChain{
+			{
 				.stageCount = 2,
 				.pStages = stages.data(),
 				.pVertexInputState = &vertexInputInfo,
@@ -692,41 +659,29 @@ void Program::CreateGraphicsPipeline()
 			nullptr,
 			pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>()),
 	};
-	if (!pipeline.has_value())
-	{
-		std::println(stderr, "ERROR: {}", vk::to_string(pipeline.result));
-		std::exit(1);
-	}
+	CheckError(pipeline);
 	this->graphicsPipeline = std::move(pipeline.value);
 }
 void Program::CreateCommandPool()
 {
-	vk::CommandPoolCreateInfo poolCreateInfo{
+	vk::CommandPoolCreateInfo poolInfo{
 		.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
 		.queueFamilyIndex = this->graphicsIdx,
 	};
-	auto commandPool{this->device.createCommandPool(poolCreateInfo)};
-	if (!commandPool.has_value())
-	{
-		std::println(stderr, "ERROR: {}", vk::to_string(commandPool.result));
-		std::exit(1);
-	}
+	auto commandPool{this->device.createCommandPool(poolInfo)};
+	CheckError(commandPool);
 	this->commandPool = std::move(commandPool.value);
 }
 void Program::CreateCommandBuffer()
 {
-	vk::CommandBufferAllocateInfo allocateInfo{
+	vk::CommandBufferAllocateInfo allocInfo{
 		.commandPool = this->commandPool,
 		.level = vk::CommandBufferLevel::ePrimary,
 		.commandBufferCount = 1,
 	};
-	auto buffers{this->device.allocateCommandBuffers(allocateInfo)};
-	if (!buffers.has_value())
-	{
-		std::println(stderr, "ERROR: {}", vk::to_string(buffers.result));
-		std::exit(1);
-	}
-	else if (buffers->empty())
+	auto buffers{this->device.allocateCommandBuffers(allocInfo)};
+	CheckError(buffers);
+	if (buffers.value.empty())
 	{
 		std::println(stderr, "ERROR: No command buffers allocated");
 		std::exit(1);
@@ -735,7 +690,8 @@ void Program::CreateCommandBuffer()
 }
 void Program::RecordCommandBuffer(uint32_t imgIdx)
 {
-	this->commandBuffer.begin({});
+	commandBuffer.begin({});
+
 	this->TransitionImageLayout(
 		imgIdx, vk::ImageLayout::eUndefined,
 		vk::ImageLayout::eColorAttachmentOptimal, //
@@ -747,7 +703,7 @@ void Program::RecordCommandBuffer(uint32_t imgIdx)
 	vk::ClearValue clearColor{
 		vk::ClearColorValue(0.133f, 0.302f, 0.855f, 1.0f)};
 	vk::RenderingAttachmentInfo attachmentInfo{
-		.imageView = this->swapChainImageViews[imgIdx],
+		.imageView = this->swapChainImageViews.at(imgIdx),
 		.imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
 		.loadOp = vk::AttachmentLoadOp::eClear,
 		.storeOp = vk::AttachmentStoreOp::eStore,
@@ -755,7 +711,7 @@ void Program::RecordCommandBuffer(uint32_t imgIdx)
 	};
 	vk::RenderingInfo renderingInfo{
 		.renderArea = {
-			.offset = { .x= 0, .y = 0 },
+			.offset = {.x = 0, .y = 0},
 			.extent = this->swapChainExtent,
 		},
 		.layerCount = 1,
@@ -765,7 +721,7 @@ void Program::RecordCommandBuffer(uint32_t imgIdx)
 
 	this->commandBuffer.beginRendering(renderingInfo);
 	this->commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
-									 this->graphicsPipeline);
+									 *this->graphicsPipeline);
 	this->commandBuffer.setViewport(
 		0, vk::Viewport(
 			   0.0f, 0.0f, static_cast<float>(this->swapChainExtent.width),
@@ -775,6 +731,7 @@ void Program::RecordCommandBuffer(uint32_t imgIdx)
 	this->commandBuffer.draw(3, 1, 0, 0);
 
 	this->commandBuffer.endRendering();
+
 	this->TransitionImageLayout(
 		imgIdx, vk::ImageLayout::eColorAttachmentOptimal,
 		vk::ImageLayout::ePresentSrcKHR,
@@ -819,28 +776,16 @@ void Program::TransitionImageLayout(uint32_t imgIdx, vk::ImageLayout oldLayout,
 void Program::CreateSyncObjects()
 {
 	auto present{this->device.createSemaphore({})};
-	if (!present.has_value())
-	{
-		std::println(stderr, "ERROR: {}", vk::to_string(present.result));
-		std::exit(1);
-	}
+	CheckError(present);
 	this->presentCompleteSemaphore = std::move(present.value);
 
 	auto render{this->device.createSemaphore({})};
-	if (!render.has_value())
-	{
-		std::println(stderr, "ERROR: {}", vk::to_string(render.result));
-		std::exit(1);
-	}
+	CheckError(render);
 	this->renderFinishedSemaphore = std::move(render.value);
 
 	auto draw{
 		this->device.createFence({.flags = vk::FenceCreateFlagBits::eSignaled}),
 	};
-	if (!draw.has_value())
-	{
-		std::println(stderr, "ERROR: {}", vk::to_string(draw.result));
-		std::exit(1);
-	}
+	CheckError(draw);
 	this->drawFence = std::move(draw.value);
 }

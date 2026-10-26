@@ -3,8 +3,8 @@
 #include <GLFW/glfw3.h>
 #include <vulkan/vulkan_raii.hpp>
 
-constexpr int WINDOW_WIDTH = 600;
-constexpr int WINDOW_HEIGHT = 600;
+constexpr uint32_t WINDOW_WIDTH = 600;
+constexpr uint32_t WINDOW_HEIGHT = 600;
 
 class Program
 {
@@ -44,16 +44,17 @@ class Program
 	vk::raii::PhysicalDevice physicalDevice{nullptr};
 	vk::raii::Device device{nullptr};
 
-	vk::raii::Queue graphicsQueue{nullptr};
 	uint32_t graphicsIdx{~0u};
+	vk::raii::Queue graphicsQueue{nullptr};
 	vk::raii::SwapchainKHR swapChain{nullptr};
 	std::vector<vk::Image> swapChainImages;
-	std::vector<vk::ImageView> swapChainImageViews;
 	vk::SurfaceFormatKHR swapChainSurfaceFormat;
 	vk::Extent2D swapChainExtent;
+	std::vector<vk::raii::ImageView> swapChainImageViews;
 
 	vk::raii::PipelineLayout pipelineLayout{nullptr};
 	vk::raii::Pipeline graphicsPipeline{nullptr};
+
 	vk::raii::CommandPool commandPool{nullptr};
 	vk::raii::CommandBuffer commandBuffer{nullptr};
 
