@@ -3,7 +3,7 @@
 #include <GLFW/glfw3.h>
 #include <vulkan/vulkan_raii.hpp>
 
-constexpr int WINDOW_WIDTH = 800;
+constexpr int WINDOW_WIDTH = 600;
 constexpr int WINDOW_HEIGHT = 600;
 
 class Program
@@ -57,7 +57,7 @@ class Program
 	vk::raii::CommandPool commandPool{nullptr};
 	vk::raii::CommandBuffer commandBuffer{nullptr};
 
-	vk::raii::Semaphore presentCompleteS{nullptr};
-	vk::raii::Semaphore renderFinishedS{nullptr};
+	vk::raii::Semaphore presentCompleteSemaphore{nullptr};
+	vk::raii::Semaphore renderFinishedSemaphore{nullptr};
 	vk::raii::Fence drawFence{nullptr};
 };

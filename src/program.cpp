@@ -1,23 +1,25 @@
 #include "program.hpp"
 
-#include <GLFW/glfw3.h>
-#include <csignal>
 #include <fstream>
 #include <map>
 #include <print>
 #include <ranges>
+#include <vector>
 
-constexpr std::string SHADER_EXTENSION{".spv"};
-
-const std::vector<const char*> VALIDATION_LAYERS = {
-	// NOLINT
-	"VK_LAYER_KHRONOS_validation",
-};
 #ifdef NDEBUG
 constexpr bool ENABLE_VALIDATION{false};
 #else
 constexpr bool ENABLE_VALIDATION{true};
 #endif // !NDEBUG
+
+constexpr std::string SHADER_EXTENSION{".spv"};
+
+const std::vector<const char*> VALIDATION_LAYERS = {
+	"VK_LAYER_KHRONOS_validation",
+};
+const std::vector<const char*> REQUIRED_DEVICE_EXTENSIONS{
+	vk::KHRSwapchainExtensionName,
+};
 
 constexpr auto IsGraphicsQueue(const vk::QueueFamilyProperties& val) -> bool
 {
@@ -54,6 +56,7 @@ void Program::Run()
 		this->Update();
 		this->Draw();
 	}
+	this->device.waitIdle();
 
 	// Cleanup
 	glfwDestroyWindow(this->window);
@@ -94,29 +97,43 @@ void Program::Draw()
 	this->device.resetFences(*this->drawFence);
 
 	auto [result, imageIdx] = this->swapChain.acquireNextImage(
-		UINT64_MAX, *this->presentCompleteS, nullptr);
+		UINT64_MAX, *this->presentCompleteSemaphore, nullptr);
 	this->RecordCommandBuffer(imageIdx);
+	this->graphicsQueue.waitIdle();
+
 	vk::PipelineStageFlags waitDestStageMask{
 		vk::PipelineStageFlagBits::eColorAttachmentOutput};
 	const vk::SubmitInfo submitInfo{
 		.waitSemaphoreCount = 1,
-		.pWaitSemaphores = &*this->presentCompleteS,
+		.pWaitSemaphores = &*this->presentCompleteSemaphore,
 		.pWaitDstStageMask = &waitDestStageMask,
 		.commandBufferCount = 1,
 		.pCommandBuffers = &*this->commandBuffer,
 		.signalSemaphoreCount = 1,
-		.pSignalSemaphores = &*this->renderFinishedS,
+		.pSignalSemaphores = &*this->renderFinishedSemaphore,
 	};
 	this->graphicsQueue.submit(submitInfo, *this->drawFence);
 
 	vk::PresentInfoKHR presentInfo{
 		.waitSemaphoreCount = 1,
-		.pWaitSemaphores = &*this->renderFinishedS,
+		.pWaitSemaphores = &*this->renderFinishedSemaphore,
 		.swapchainCount = 1,
 		.pSwapchains = &*this->swapChain,
 		.pImageIndices = &imageIdx,
 	};
 	result = this->graphicsQueue.presentKHR(presentInfo);
+	switch (result)
+	{
+	case vk::Result::eSuccess:
+		break;
+	case vk::Result::eSuboptimalKHR:
+		std::println(
+			stdout,
+			"vk::Queue::presentKHR returned vk::Result::eSuboptimalKHR !");
+		break;
+	default:
+		break; // an unexpected result is returned!
+	}
 }
 
 void Program::CreateVKInstance()
@@ -160,7 +177,7 @@ void Program::CreateVKInstance()
 	const char** glfwExtensions{
 		glfwGetRequiredInstanceExtensions(&glfwExtensionCount),
 	};
-	auto extensionProps{context.enumerateInstanceExtensionProperties()};
+	auto extensionProps{this->context.enumerateInstanceExtensionProperties()};
 	if (!extensionProps.has_value())
 	{
 		std::println(stderr, "ERROR: {}", vk::to_string(extensionProps.result));
@@ -192,10 +209,11 @@ void Program::CreateVKInstance()
 
 	vk::InstanceCreateInfo createInfo{
 		.pApplicationInfo = &appInfo,
+		.enabledLayerCount = static_cast<uint32_t>(requiredLayers.size()),
+		.ppEnabledLayerNames = requiredLayers.data(),
 		.enabledExtensionCount = glfwExtensionCount,
 		.ppEnabledExtensionNames = glfwExtensions,
 	};
-
 	auto temp = this->context.createInstance(createInfo);
 	if (!temp.has_value())
 	{
@@ -228,17 +246,15 @@ void Program::PickPhysicalDevice()
 	if (!devices.has_value())
 	{
 		std::println(stderr, "ERROR: {}", vk::to_string(devices.result));
-		std::exit(0);
+		std::exit(1);
 	}
 	if (devices->empty())
 	{
 		std::println(stderr, "ERROR: Failed to find GPUs with Vulkan support");
-		std::exit(0);
+		std::exit(1);
 	}
 
 	std::multimap<int, vk::raii::PhysicalDevice> candidateGPUs;
-
-	std::vector<const char*> requiredExtensions{vk::KHRSwapchainExtensionName};
 
 	std::println(stdout, "Finding Suitable GPUs");
 
@@ -248,27 +264,21 @@ void Program::PickPhysicalDevice()
 		auto deviceProps{device.getProperties()};
 		std::println(stdout, "Found GPU: {}",
 					 std::string(deviceProps.deviceName));
-		// auto deviceFeats{device.getFeatures()};
-		auto deviceFeats{
-			device.getFeatures2<
-				vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features,
-				vk::PhysicalDeviceVulkan13Features,
-				vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>(),
-		};
-		bool hasRequiredFeats
-			= (deviceFeats.get<vk::PhysicalDeviceVulkan11Features>()
-				   .shaderDrawParameters
-			   != vk::False)
-			  && (deviceFeats.get<vk::PhysicalDeviceVulkan13Features>()
-					  .dynamicRendering
-				  != vk::False)
-			  && (deviceFeats
-					  .get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>()
-					  .extendedDynamicState
-				  != vk::False);
+		if (deviceProps.apiVersion < vk::ApiVersion13)
+		{
+			std::println(stdout, "	GPU failed because: Incorrect API Version");
+			continue;
+		}
 
 		auto queueFamilies{device.getQueueFamilyProperties()};
-		auto deviceExtensions = device.enumerateDeviceExtensionProperties();
+		if (r::none_of(queueFamilies, IsGraphicsQueue))
+		{
+			std::println(stdout,
+						 "	GPU failed because: Missing queue families");
+			continue;
+		}
+
+		auto deviceExtensions{device.enumerateDeviceExtensionProperties()};
 		auto extensionCheck = [&deviceExtensions](const auto& val) -> bool
 		{
 			auto cmp = [val](const auto& ext) -> bool
@@ -277,32 +287,35 @@ void Program::PickPhysicalDevice()
 			};
 			return r::any_of(deviceExtensions.value, cmp);
 		};
-		uint32_t score{0};
-
-		// if (deviceFeats.geometryShader == 0u)
-		// 	continue;
-		if (!hasRequiredFeats)
-		{
-			std::println(stdout, "	GPU failed because: Missing features");
-			continue;
-		}
-		if (deviceProps.apiVersion < vk::ApiVersion13)
-		{
-			std::println(stdout, "	GPU failed because: Incorrect API Version");
-			continue;
-		}
-		if (r::none_of(queueFamilies, IsGraphicsQueue))
-		{
-			std::println(stdout,
-						 "	GPU failed because: Missing queue families");
-			continue;
-		}
-		if (!r::all_of(requiredExtensions, extensionCheck))
+		if (!r::all_of(REQUIRED_DEVICE_EXTENSIONS, extensionCheck))
 		{
 			std::println(stdout, "	GPU failed because: Missing extensions");
 			continue;
 		}
 
+		auto feats{
+			device.getFeatures2<
+				vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features,
+				vk::PhysicalDeviceVulkan13Features,
+				vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>(),
+		};
+		bool hasRequiredFeats
+			= (feats.get<vk::PhysicalDeviceVulkan11Features>()
+				   .shaderDrawParameters
+			   != vk::False)
+			  && (feats.get<vk::PhysicalDeviceVulkan13Features>()
+					  .dynamicRendering
+				  != vk::False)
+			  && (feats.get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>()
+					  .extendedDynamicState
+				  != vk::False);
+		if (!hasRequiredFeats)
+		{
+			std::println(stdout, "	GPU failed because: Missing features");
+			continue;
+		}
+
+		uint32_t score{0};
 		switch (deviceProps.deviceType)
 		{
 			using enum vk::PhysicalDeviceType;
@@ -318,8 +331,8 @@ void Program::PickPhysicalDevice()
 		default:
 			break;
 		}
-
 		score += deviceProps.limits.maxImageDimension2D;
+
 		candidateGPUs.insert({score, device});
 	}
 	if (!candidateGPUs.empty() && candidateGPUs.rbegin()->first > 0)
@@ -339,11 +352,7 @@ void Program::CreateLogicalDevice()
 {
 	namespace r = std::ranges;
 	auto queueFamProperties{this->physicalDevice.getQueueFamilyProperties()};
-	auto graphicsQueueFamIt{
-		r::find_if(queueFamProperties,
-				   [](const auto& val) { return IsGraphicsQueue(val); }),
-	};
-	// uint32_t this->graphicsIdx{~0u};
+
 	for (const uint32_t i : r::views::iota(0u, queueFamProperties.size()))
 	{
 		const auto& queueFam{queueFamProperties[i]};
@@ -369,14 +378,7 @@ void Program::CreateLogicalDevice()
 					 "ERROR: Could not find suitable graphics/presnt queue");
 		std::exit(1);
 	}
-	// auto this->graphicsIdx{static_cast<uint32_t>(
-	// 	r::distance(queueFamProperties.begin(), graphicsQueueFamIt))};
-	const float queuePrio{0.5f};
-	vk::DeviceQueueCreateInfo deviceQueueCreateInfo{
-		.queueFamilyIndex = this->graphicsIdx,
-		.queueCount = 1,
-		.pQueuePriorities = &queuePrio,
-	};
+
 	vk::StructureChain<vk::PhysicalDeviceFeatures2,
 					   vk::PhysicalDeviceVulkan11Features,
 					   vk::PhysicalDeviceVulkan13Features,
@@ -387,17 +389,22 @@ void Program::CreateLogicalDevice()
 			{.synchronization2 = vk::True, .dynamicRendering = vk::True},
 			{.extendedDynamicState = vk::True},
 	};
-	std::vector<const char*> requiredDeviceExtensions{
-		vk::KHRSwapchainExtensionName,
+
+	const float queuePrio{0.5f};
+	vk::DeviceQueueCreateInfo deviceQueueCreateInfo{
+		.queueFamilyIndex = this->graphicsIdx,
+		.queueCount = 1,
+		.pQueuePriorities = &queuePrio,
 	};
 	vk::DeviceCreateInfo deviceCreateInfo{
 		.pNext = &featureChain.get<vk::PhysicalDeviceFeatures2>(),
 		.queueCreateInfoCount = 1,
 		.pQueueCreateInfos = &deviceQueueCreateInfo,
 		.enabledExtensionCount
-		= static_cast<uint32_t>(requiredDeviceExtensions.size()),
-		.ppEnabledExtensionNames = requiredDeviceExtensions.data(),
+		= static_cast<uint32_t>(REQUIRED_DEVICE_EXTENSIONS.size()),
+		.ppEnabledExtensionNames = REQUIRED_DEVICE_EXTENSIONS.data(),
 	};
+
 	auto device = this->physicalDevice.createDevice(deviceCreateInfo);
 	if (!device.has_value())
 	{
@@ -416,50 +423,12 @@ void Program::CreateSwapChain()
 	const auto surfaceCapabilities{
 		this->physicalDevice.getSurfaceCapabilitiesKHR(*this->surface),
 	};
-	auto availableFormats{
-		this->physicalDevice.getSurfaceFormatsKHR(*this->surface),
-	};
-	auto availablePresentModes{
-		this->physicalDevice.getSurfacePresentModesKHR(*this->surface),
-	};
 	if (!surfaceCapabilities.has_value())
 	{
 		std::println(stderr, "ERROR: {}",
 					 vk::to_string(surfaceCapabilities.result));
 		std::exit(1);
 	}
-	if (!availableFormats.has_value())
-	{
-		std::println(stderr, "ERROR: {}",
-					 vk::to_string(availableFormats.result));
-		std::exit(1);
-	}
-	if (!availablePresentModes.has_value())
-	{
-		std::println(stderr, "ERROR: {}",
-					 vk::to_string(availablePresentModes.result));
-		std::exit(1);
-	}
-
-	auto formatCond = [](const auto& val) -> bool
-	{
-		return (val.format == vk::Format::eB8G8R8A8Srgb)
-			   && (val.colorSpace == vk::ColorSpaceKHR::eSrgbNonlinear);
-	};
-	const auto formatIt{r::find_if(availableFormats.value, formatCond)};
-	this->swapChainSurfaceFormat = formatIt != availableFormats->end()
-									   ? *formatIt
-									   : availableFormats.value.at(0);
-
-	auto modeCond = [](const auto mode) -> bool
-	{
-		return mode == vk::PresentModeKHR::eMailbox;
-	};
-	auto presentMode{
-		r::any_of(availablePresentModes.value, modeCond)
-			? vk::PresentModeKHR::eMailbox
-			: vk::PresentModeKHR::eFifo,
-	};
 
 	bool isExtentUnset = surfaceCapabilities->currentExtent.width
 						 != std::numeric_limits<uint32_t>::max();
@@ -469,8 +438,8 @@ void Program::CreateSwapChain()
 	}
 	else
 	{
-		int width;
-		int height;
+		int width{};
+		int height{};
 		glfwGetFramebufferSize(this->window, &width, &height);
 		width = static_cast<int>(
 			std::clamp<uint32_t>(static_cast<uint32_t>(width),
@@ -499,6 +468,44 @@ void Program::CreateSwapChain()
 		minImgCount = surfaceCapabilities->maxImageCount;
 	}
 
+	auto availableFormats{
+		this->physicalDevice.getSurfaceFormatsKHR(*this->surface),
+	};
+	if (!availableFormats.has_value())
+	{
+		std::println(stderr, "ERROR: {}",
+					 vk::to_string(availableFormats.result));
+		std::exit(1);
+	}
+	auto formatCond = [](const auto& val) -> bool
+	{
+		return (val.format == vk::Format::eB8G8R8A8Srgb)
+			   && (val.colorSpace == vk::ColorSpaceKHR::eSrgbNonlinear);
+	};
+	const auto formatIt{r::find_if(availableFormats.value, formatCond)};
+	this->swapChainSurfaceFormat = formatIt != availableFormats->end()
+									   ? *formatIt
+									   : availableFormats.value.at(0);
+
+	auto availablePresentModes{
+		this->physicalDevice.getSurfacePresentModesKHR(*this->surface),
+	};
+	if (!availablePresentModes.has_value())
+	{
+		std::println(stderr, "ERROR: {}",
+					 vk::to_string(availablePresentModes.result));
+		std::exit(1);
+	}
+	auto modeCond = [](const auto mode) -> bool
+	{
+		return mode == vk::PresentModeKHR::eMailbox;
+	};
+	auto presentMode{
+		r::any_of(availablePresentModes.value, modeCond)
+			? vk::PresentModeKHR::eMailbox
+			: vk::PresentModeKHR::eFifo,
+	};
+
 	vk::SwapchainCreateInfoKHR createInfo{
 		.surface = *this->surface,
 		.minImageCount = minImgCount,
@@ -509,10 +516,9 @@ void Program::CreateSwapChain()
 		.imageUsage = vk::ImageUsageFlagBits::eColorAttachment,
 		.imageSharingMode = vk::SharingMode::eExclusive,
 		.preTransform = surfaceCapabilities->currentTransform,
-		// Change for blending
 		.compositeAlpha = vk::CompositeAlphaFlagBitsKHR::eOpaque,
 		.presentMode = presentMode,
-		.clipped = 1u,
+		.clipped = vk::True,
 	};
 	auto swapChain{this->device.createSwapchainKHR(createInfo)};
 	if (!swapChain.has_value())
@@ -540,11 +546,13 @@ void Program::CreateImageViews()
 	vk::ImageViewCreateInfo viewCreateInfo{
 		.viewType = vk::ImageViewType::e2D,
 		.format = this->swapChainSurfaceFormat.format,
-		.subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
-							 .baseMipLevel = 0,
-							 .levelCount = 1,
-							 .baseArrayLayer = 0,
-							 .layerCount = 1,},
+		.subresourceRange = {
+			.aspectMask = vk::ImageAspectFlagBits::eColor,
+			.baseMipLevel = 0,
+			.levelCount = 1,
+			.baseArrayLayer = 0,
+			.layerCount = 1,
+		},
 	};
 	for (auto& image : this->swapChainImages)
 	{
@@ -611,8 +619,7 @@ void Program::CreateGraphicsPipeline()
 		.lineWidth = 1.0f,
 	};
 
-	vk::PipelineMultisampleStateCreateInfo multisampling{};
-	multisampling = {
+	vk::PipelineMultisampleStateCreateInfo multisampling{
 		.rasterizationSamples = vk::SampleCountFlagBits::e1,
 		.sampleShadingEnable = vk::False,
 	};
@@ -660,26 +667,24 @@ void Program::CreateGraphicsPipeline()
 
 	vk::StructureChain<vk::GraphicsPipelineCreateInfo,
 					   vk::PipelineRenderingCreateInfo>
-		pipelineCreateInfoChain{};
-	pipelineCreateInfoChain = {
-		vk::GraphicsPipelineCreateInfo{
-			.stageCount = 2,
-			.pStages = stages.data(),
-			.pVertexInputState = &vertexInputInfo,
-			.pInputAssemblyState = &inputAssembly,
-			.pViewportState = &viewportState,
-			.pRasterizationState = &rasterizer,
-			.pMultisampleState = &multisampling,
-			.pColorBlendState = &colorBlending,
-			.pDynamicState = &dynamicState,
-			.layout = this->pipelineLayout,
-			// .layout = pipelineLayout.value,
-			.renderPass = nullptr,
-		},
-		{
-			.colorAttachmentCount = 1,
-			.pColorAttachmentFormats = &this->swapChainSurfaceFormat.format,
-		},
+		pipelineCreateInfoChain = {
+			vk::GraphicsPipelineCreateInfo{
+				.stageCount = 2,
+				.pStages = stages.data(),
+				.pVertexInputState = &vertexInputInfo,
+				.pInputAssemblyState = &inputAssembly,
+				.pViewportState = &viewportState,
+				.pRasterizationState = &rasterizer,
+				.pMultisampleState = &multisampling,
+				.pColorBlendState = &colorBlending,
+				.pDynamicState = &dynamicState,
+				.layout = this->pipelineLayout,
+				.renderPass = nullptr,
+			},
+			{
+				.colorAttachmentCount = 1,
+				.pColorAttachmentFormats = &this->swapChainSurfaceFormat.format,
+			},
 	};
 
 	auto pipeline{
@@ -733,12 +738,14 @@ void Program::RecordCommandBuffer(uint32_t imgIdx)
 	this->commandBuffer.begin({});
 	this->TransitionImageLayout(
 		imgIdx, vk::ImageLayout::eUndefined,
-		vk::ImageLayout::eColorAttachmentOptimal, {},
+		vk::ImageLayout::eColorAttachmentOptimal, //
+		{},										  // blank
 		vk::AccessFlagBits2::eColorAttachmentWrite,
 		vk::PipelineStageFlagBits2::eColorAttachmentOutput,
 		vk::PipelineStageFlagBits2::eColorAttachmentOutput);
 
-	vk::ClearValue clearColor{vk::ClearColorValue(100u, 149u, 237u, 255u)};
+	vk::ClearValue clearColor{
+		vk::ClearColorValue(0.133f, 0.302f, 0.855f, 1.0f)};
 	vk::RenderingAttachmentInfo attachmentInfo{
 		.imageView = this->swapChainImageViews[imgIdx],
 		.imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
@@ -756,7 +763,6 @@ void Program::RecordCommandBuffer(uint32_t imgIdx)
 		.pColorAttachments = &attachmentInfo,
 	};
 
-	raise(SIGTRAP);
 	this->commandBuffer.beginRendering(renderingInfo);
 	this->commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
 									 this->graphicsPipeline);
@@ -772,7 +778,8 @@ void Program::RecordCommandBuffer(uint32_t imgIdx)
 	this->TransitionImageLayout(
 		imgIdx, vk::ImageLayout::eColorAttachmentOptimal,
 		vk::ImageLayout::ePresentSrcKHR,
-		vk::AccessFlagBits2::eColorAttachmentWrite, {},
+		vk::AccessFlagBits2::eColorAttachmentWrite, //
+		{},											// blank
 		vk::PipelineStageFlagBits2::eColorAttachmentOutput,
 		vk::PipelineStageFlagBits2::eBottomOfPipe);
 	this->commandBuffer.end();
@@ -817,12 +824,16 @@ void Program::CreateSyncObjects()
 		std::println(stderr, "ERROR: {}", vk::to_string(present.result));
 		std::exit(1);
 	}
+	this->presentCompleteSemaphore = std::move(present.value);
+
 	auto render{this->device.createSemaphore({})};
 	if (!render.has_value())
 	{
 		std::println(stderr, "ERROR: {}", vk::to_string(render.result));
 		std::exit(1);
 	}
+	this->renderFinishedSemaphore = std::move(render.value);
+
 	auto draw{
 		this->device.createFence({.flags = vk::FenceCreateFlagBits::eSignaled}),
 	};
@@ -831,8 +842,5 @@ void Program::CreateSyncObjects()
 		std::println(stderr, "ERROR: {}", vk::to_string(draw.result));
 		std::exit(1);
 	}
-
-	this->presentCompleteS = std::move(present.value);
-	this->renderFinishedS = std::move(render.value);
 	this->drawFence = std::move(draw.value);
 }
